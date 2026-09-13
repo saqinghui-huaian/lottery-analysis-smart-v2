@@ -2,9 +2,9 @@
 
 ## Working APIs (verified 2026-06-14)
 
-### Sporttery (official) - BEST for 排列三/排列五
+### Sporttery (official) - BEST for 排列三 & 大乐透
 - Base URL: `https://webapi.sporttery.cn/gateway/lottery/getHistoryPageListV1.qry`
-- Game numbers: 35=排列三, 37=排列五
+- Game numbers: 35=排列三, 85=大乐透
 - **Recommended (WAF-free, verified 2026-06-27)**: Use mobile User-Agent + mobile Referer:
   ```
   User-Agent: Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36
