@@ -1,26 +1,52 @@
 #!/usr/bin/env python3
 """
-智能选号系统 V3.0 (2026-09-25 重构)
+智能选号系统 V3.1 (2026-09-25)
 
-核心理念：基于多维统计模型的加权推荐，提供有指向性的号码选择
+核心理念：基于理论概率分布的智能选号，不是预测
 
-V3.0 核心改进：
-1. 贝叶斯后验概率：先验均匀 × 观测频率 → 后验估计
-2. 指数衰减加权：近5期×5, 5-10×3, 10-20×2, 20-50×1
-3. 复隔中分析：专业分析师常用的核心维度
-4. 多策略共识：8种策略独立评分
-5. 蒙特卡洛模拟：随机生成+多维过滤
-6. 信息熵分析：衡量号码分布的随机性
+⚠️ 数学基础（最重要）：
+彩票开奖是独立随机事件。每期开奖号码与历史数据无关。
+
+V2.5 明确删除的方法（独立随机事件无意义）：
+- 马尔可夫链转移概率（独立随机事件无意义）
+- 信息熵（描述历史，不预测未来）
+- 贝叶斯推断（独立随机事件退化为无用）
+- 自相关分析（小样本假阳性）
+- 时间序列特征（独立随机事件无意义）
+
+V3.1 保留的有效方法：
+- 和值概率分布（理论概率：7-20占83.2%）
+- 跨度概率分布（理论概率：4-7最常见）
+- 形态分布（组六72%、组三27%、豹子1%）
+- 奇偶平衡（1:2或2:1各37.5%）
+- 大小平衡（1:2或2:1各37.5%）
+- 012路平衡（0路40%、1路30%、2路30%）
+- 质合比（质数2,3,5,7占40%）
+- 蒙特卡洛+多维过滤（基于理论概率）
+- 用户偏好调整（保守/激进）
+
+V3.1 改进（相比V2.5）：
+1. 更精确的理论概率计算（已验证）
+2. 蒙特卡洛候选生成（更高效）
+3. 更好的覆盖面约束
+4. 更清晰的代码结构
 """
 
 import random
-import math
 from collections import Counter
 from typing import List, Dict, Tuple, Optional
 
 
 class SmartNumberSelector:
-    """智能选号系统 V3.0"""
+    """
+    智能选号系统 V3.1
+    
+    核心原则：
+    1. 彩票是独立随机事件，历史数据不能预测未来
+    2. 选号策略基于理论概率分布，不是"模式识别"
+    3. 选择"更合理"的号码组合，不是"更可能中"的组合
+    4. 合理 = 符合概率分布，避免极端组合
+    """
     
     # 理论概率分布（枚举计算，精确值）
     SUM_PROBS = {}  # 和值 -> 概率
@@ -54,38 +80,21 @@ class SmartNumberSelector:
             self.SPAN_PROBS[span] = cnt / total
     
     def compute_context(self, data: List[Dict]) -> Dict:
+        """
+        计算统计上下文（只保留有用的维度）
+        
+        有用的维度：
+        - 各位频率（用于用户偏好：热号/冷号）
+        - 遗漏值（作为参考维度，不是主要依据）
+        - 近期和值/跨度分布（用于候选生成）
+        - 形态分布（用于覆盖面约束）
+        - 奇偶/大小分布（用于覆盖面约束）
+        - 012路频率（用于覆盖面约束）
+        """
         ctx = {}
         n = len(data)
         
-        # 贝叶斯后验概率
-        freq_all = [Counter(), Counter(), Counter()]
-        for d in data:
-            for pos, key in enumerate(['h', 't', 'u']):
-                freq_all[pos][d[key]] += 1
-        
-        ctx['bayesian'] = [{}, {}, {}]
-        for pos in range(3):
-            total = sum(freq_all[pos].values()) or 1
-            prior = 1.0 / 10
-            for digit in range(10):
-                likelihood = freq_all[pos].get(digit, 0) / total
-                ctx['bayesian'][pos][digit] = prior * likelihood
-            total_bayes = sum(ctx['bayesian'][pos].values())
-            if total_bayes > 0:
-                for digit in range(10):
-                    ctx['bayesian'][pos][digit] /= total_bayes
-        
-        # 指数衰减加权热度
-        ctx['heat_weighted'] = [Counter(), Counter(), Counter()]
-        for idx, d in enumerate(data[:50]):
-            if idx < 5: w = 5
-            elif idx < 10: w = 3
-            elif idx < 20: w = 2
-            else: w = 1
-            for pos, key in enumerate(['h', 't', 'u']):
-                ctx['heat_weighted'][pos][d[key]] += w
-        
-        # 传统频率
+        # 1. 各位频率（近20/50期）
         ctx['freq20'] = [Counter(), Counter(), Counter()]
         ctx['freq50'] = [Counter(), Counter(), Counter()]
         for d in data[:20]:
@@ -95,13 +104,16 @@ class SmartNumberSelector:
             for pos, key in enumerate(['h', 't', 'u']):
                 ctx['freq50'][pos][d[key]] += 1
         
+        # 2. 加权热度（近20期×3，20-50期×1）
         ctx['weighted'] = Counter()
         for d in data[:20]:
-            for x in [d['h'], d['t'], d['u']]: ctx['weighted'][x] += 3
+            for x in [d['h'], d['t'], d['u']]:
+                ctx['weighted'][x] += 3
         for d in data[20:50]:
-            for x in [d['h'], d['t'], d['u']]: ctx['weighted'][x] += 1
+            for x in [d['h'], d['t'], d['u']]:
+                ctx['weighted'][x] += 1
         
-        # 遗漏值
+        # 3. 遗漏值（用于遗漏回补参考）
         ctx['miss'] = [{}, {}, {}]
         for digit in range(10):
             for pos, key in enumerate(['h', 't', 'u']):
@@ -112,61 +124,43 @@ class SmartNumberSelector:
                 else:
                     ctx['miss'][pos][digit] = n
         
-        # 复隔中分布
-        if len(data) >= 2:
-            last_nums = set([data[0]['h'], data[0]['t'], data[0]['u']])
-            prev_nums = set([data[1]['h'], data[1]['t'], data[1]['u']])
-            ctx['repeat_codes'] = last_nums
-            ctx['gap_codes'] = prev_nums - last_nums
-            ctx['mid_codes'] = set(range(10)) - last_nums - ctx['gap_codes']
-        else:
-            ctx['repeat_codes'] = set()
-            ctx['gap_codes'] = set()
-            ctx['mid_codes'] = set(range(10))
+        # 4. 近期和值/跨度分布
+        ctx['recent_sums'] = [d['h'] + d['t'] + d['u'] for d in data[:20]]
+        ctx['recent_spans'] = [max(d['h'], d['t'], d['u']) - min(d['h'], d['t'], d['u']) for d in data[:20]]
         
-        # 和值统计
-        sums = [d['h'] + d['t'] + d['u'] for d in data[:50]]
-        ctx['hz_avg'] = sum(sums) / len(sums) if sums else 13.5
-        
-        ctx['sum_tail_miss'] = {}
-        for tail in range(10):
-            for i, d in enumerate(data):
-                if (d['h'] + d['t'] + d['u']) % 10 == tail:
-                    ctx['sum_tail_miss'][tail] = i
-                    break
-            else:
-                ctx['sum_tail_miss'][tail] = n
-        
-        # 跨度统计
-        spans = [max(d['h'], d['t'], d['u']) - min(d['h'], d['t'], d['u']) for d in data[:50]]
-        ctx['kd_avg'] = sum(spans) / len(spans) if spans else 4.5
-        
-        ctx['span_miss'] = {}
-        for sp in range(10):
-            for i, d in enumerate(data):
-                kd = max(d['h'], d['t'], d['u']) - min(d['h'], d['t'], d['u'])
-                if kd == sp:
-                    ctx['span_miss'][sp] = i
-                    break
-            else:
-                ctx['span_miss'][sp] = n
-        
-        # 形态统计
+        # 5. 近期形态分布
         ctx['recent_shapes'] = Counter()
         for d in data[:20]:
             unique = len(set([d['h'], d['t'], d['u']]))
-            if unique == 1: ctx['recent_shapes']['baozi'] += 1
-            elif unique == 2: ctx['recent_shapes']['zusan'] += 1
-            else: ctx['recent_shapes']['zuliu'] += 1
+            if unique == 1:
+                ctx['recent_shapes']['baozi'] += 1
+            elif unique == 2:
+                ctx['recent_shapes']['zusan'] += 1
+            else:
+                ctx['recent_shapes']['zuliu'] += 1
         
+        # 6. 和值均值（用于候选生成）
+        sums = [d['h'] + d['t'] + d['u'] for d in data[:50]]
+        ctx['hz_avg'] = sum(sums) / len(sums) if sums else 13.5
+        
+        # 7. 012路频率（用于候选生成）
+        ctx['road20'] = [Counter(), Counter(), Counter()]
+        for d in data[:20]:
+            for pos, key in enumerate(['h', 't', 'u']):
+                ctx['road20'][pos][d[key] % 3] += 1
+        
+        # 8. 形态统计（近50期）
         ctx['shape_cnt'] = Counter()
         for d in data[:50]:
             unique = len(set([d['h'], d['t'], d['u']]))
-            if unique == 1: ctx['shape_cnt']['豹子'] += 1
-            elif unique == 2: ctx['shape_cnt']['组三'] += 1
-            else: ctx['shape_cnt']['组六'] += 1
+            if unique == 1:
+                ctx['shape_cnt']['豹子'] += 1
+            elif unique == 2:
+                ctx['shape_cnt']['组三'] += 1
+            else:
+                ctx['shape_cnt']['组六'] += 1
         
-        # 奇偶/大小分布
+        # 9. 奇偶/大小分布（近20期）
         ctx['odd_even_cnt'] = Counter()
         ctx['big_small_cnt'] = Counter()
         for d in data[:20]:
@@ -175,202 +169,159 @@ class SmartNumberSelector:
             big = sum(1 for x in [d['h'], d['t'], d['u']] if x >= 5)
             ctx['big_small_cnt'][f'{big}:{3-big}'] += 1
         
-        # 012路频率
-        ctx['road20'] = [Counter(), Counter(), Counter()]
-        for d in data[:20]:
-            for pos, key in enumerate(['h', 't', 'u']):
-                ctx['road20'][pos][d[key] % 3] += 1
-        
-        # 伴随号
-        ctx['companion_pairs'] = Counter()
-        for d in data[:30]:
-            nums = [d['h'], d['t'], d['u']]
-            for i in range(3):
-                for j in range(i+1, 3):
-                    pair = tuple(sorted([nums[i], nums[j]]))
-                    ctx['companion_pairs'][pair] += 1
-        
-        # 信息熵
-        ctx['entropy'] = [0.0, 0.0, 0.0]
-        for pos in range(3):
-            total = sum(freq_all[pos].values()) or 1
-            probs = [freq_all[pos].get(d, 0) / total for d in range(10)]
-            ctx['entropy'][pos] = -sum(p * math.log2(p) for p in probs if p > 0)
-        ctx['max_entropy'] = math.log2(10)
-        
-        ctx['recent_sums'] = [d['h'] + d['t'] + d['u'] for d in data[:20]]
-        ctx['recent_spans'] = [max(d['h'], d['t'], d['u']) - min(d['h'], d['t'], d['u']) for d in data[:20]]
-        
         return ctx
     
-    def score_candidate_v3(self, b: int, s: int, g: int, ctx: Dict, style: str = 'balanced') -> Tuple[float, Dict]:
+    def score_candidate(self, b: int, s: int, g: int, ctx: Dict, style: str = 'balanced') -> Tuple[float, Dict]:
+        """
+        候选评分（基于理论概率，不是"模式识别"）
+        
+        评分维度：
+        1. 和值合理性（基于理论概率：7-20占83.2%）
+        2. 跨度合理性（基于理论概率：4-7占56.4%）
+        3. 形态加分（组六72% > 组三27% > 豹子1%）
+        4. 奇偶平衡（1:2或2:1各37.5%）
+        5. 大小平衡（1:2或2:1各37.5%）
+        6. 012路多样性（0路40%、1路30%、2路30%）
+        7. 质合平衡（质数2,3,5,7占40%）
+        8. 用户偏好调整（保守/激进）
+        
+        注意：不包含以下"伪科学"维度：
+        - 贝叶斯后验（独立随机事件退化为无用）
+        - 指数衰减（暗示近期热号更可能出现，是赌徒谬误）
+        - 复隔中分析（"上期号码"下期概率仍是10%）
+        - 伴随号分析（小样本伪模式）
+        - 信息熵（描述历史，不预测未来）
+        """
         details = {}
         score = 0.0
         
-        # 贝叶斯后验概率（满分15）
-        bayes_score = 0
-        for pos, digit in enumerate([b, s, g]):
-            bayes_score += ctx['bayesian'][pos].get(digit, 0.1)
-        d1 = min(bayes_score * 50, 15)
-        details['贝叶斯'] = round(d1, 1)
+        # ── 维度1: 和值合理性（满分20）──
+        hz = b + s + g
+        hz_prob = self.SUM_PROBS.get(hz, 0)
+        # 和值7-20占83.2%，这些和值的概率较高
+        if 7 <= hz <= 20:
+            d1 = 20
+        elif 5 <= hz <= 22:
+            d1 = 15
+        elif 3 <= hz <= 24:
+            d1 = 8
+        else:
+            d1 = 0
+        details['和值'] = round(d1, 1)
         score += d1
         
-        # 指数衰减热度（满分12）
-        heat_raw = 0
-        for pos, digit in enumerate([b, s, g]):
-            heat_raw += ctx['heat_weighted'][pos].get(digit, 0)
-        total_heat = sum(sum(h.values()) for h in ctx['heat_weighted'])
-        expected_heat = 3 * total_heat / 10 if total_heat > 0 else 1
-        heat_ratio = heat_raw / expected_heat if expected_heat > 0 else 1
-        
-        if style == 'conservative': d2 = min(heat_ratio * 8, 12)
-        elif style == 'aggressive': d2 = min((2 - heat_ratio) * 6, 12) if heat_ratio < 2 else 0
-        else: d2 = min(heat_ratio * 6, 12)
-        details['热度'] = round(d2, 1)
+        # ── 维度2: 跨度合理性（满分15）──
+        kd = max(b, s, g) - min(b, s, g)
+        if 4 <= kd <= 7:
+            d2 = 15
+        elif 3 <= kd <= 8:
+            d2 = 10
+        elif 2 <= kd <= 9:
+            d2 = 5
+        else:
+            d2 = 1
+        details['跨度'] = round(d2, 1)
         score += d2
         
-        # 和值合理性（满分12）
-        hz = b + s + g
-        if 7 <= hz <= 20: d3 = 12
-        elif 5 <= hz <= 22: d3 = 8
-        elif 3 <= hz <= 24: d3 = 4
-        else: d3 = 0
-        details['和值'] = round(d3, 1)
+        # ── 维度3: 形态加分（满分15）──
+        unique = len(set([b, s, g]))
+        if unique == 3:
+            d3 = 15  # 组六72%
+        elif unique == 2:
+            d3 = 8   # 组三27%
+        else:
+            d3 = 1   # 豹子1%
+        details['形态'] = round(d3, 1)
         score += d3
         
-        # 跨度合理性（满分10）
-        kd = max(b, s, g) - min(b, s, g)
-        if 4 <= kd <= 7: d4 = 10
-        elif 3 <= kd <= 8: d4 = 7
-        elif 2 <= kd <= 9: d4 = 4
-        else: d4 = 1
-        details['跨度'] = round(d4, 1)
+        # ── 维度4: 奇偶平衡（满分10）──
+        odd_count = sum(1 for x in [b, s, g] if x % 2 == 1)
+        if odd_count in [1, 2]:
+            d4 = 10
+        elif odd_count == 0 or odd_count == 3:
+            d4 = 2
+        else:
+            d4 = 5
+        details['奇偶'] = round(d4, 1)
         score += d4
         
-        # 形态加分（满分10）
-        unique = len(set([b, s, g]))
-        if unique == 3: d5 = 10
-        elif unique == 2: d5 = 6
-        else: d5 = 1
-        details['形态'] = round(d5, 1)
+        # ── 维度5: 大小平衡（满分10）──
+        big_count = sum(1 for x in [b, s, g] if x >= 5)
+        if big_count in [1, 2]:
+            d5 = 10
+        elif big_count == 0 or big_count == 3:
+            d5 = 2
+        else:
+            d5 = 5
+        details['大小'] = round(d5, 1)
         score += d5
         
-        # 奇偶平衡（满分8）
-        odd_count = sum(1 for x in [b, s, g] if x % 2 == 1)
-        if odd_count in [1, 2]: d6 = 8
-        elif odd_count == 0 or odd_count == 3: d6 = 2
-        else: d6 = 5
-        details['奇偶'] = round(d6, 1)
+        # ── 维度6: 012路多样性（满分8）──
+        roads = set([b % 3, s % 3, g % 3])
+        if len(roads) == 3:
+            d6 = 8
+        elif len(roads) == 2:
+            d6 = 4
+        else:
+            d6 = 0
+        details['012路'] = round(d6, 1)
         score += d6
         
-        # 大小平衡（满分8）
-        big_count = sum(1 for x in [b, s, g] if x >= 5)
-        if big_count in [1, 2]: d7 = 8
-        elif big_count == 0 or big_count == 3: d7 = 2
-        else: d7 = 5
-        details['大小'] = round(d7, 1)
+        # ── 维度7: 质合平衡（满分5）──
+        prime_count = sum(1 for x in [b, s, g] if x in self.PRIMES)
+        if prime_count in [1, 2]:
+            d7 = 5
+        elif prime_count == 0 or prime_count == 3:
+            d7 = 1
+        else:
+            d7 = 3
+        details['质合'] = round(d7, 1)
         score += d7
         
-        # 012路多样性（满分6）
-        roads = set([b % 3, s % 3, g % 3])
-        if len(roads) == 3: d8 = 6
-        elif len(roads) == 2: d8 = 3
-        else: d8 = 0
-        details['012路'] = round(d8, 1)
+        # ── 维度8: 用户偏好调整（满分10）──
+        if style == 'conservative':
+            # 保守型：偏好热号（近期出现频率高的数字）
+            heat = ctx['weighted'].get(b, 0) + ctx['weighted'].get(s, 0) + ctx['weighted'].get(g, 0)
+            d8 = min(heat * 0.5, 10)
+        elif style == 'aggressive':
+            # 激进型：偏好冷号（近期出现频率低的数字）
+            cold_bonus = 0
+            for pos, digit in enumerate([b, s, g]):
+                if ctx['freq20'][pos].get(digit, 0) <= 1:
+                    cold_bonus += 3
+            d8 = min(cold_bonus, 10)
+        else:
+            d8 = 0
+        details['偏好'] = round(d8, 1)
         score += d8
-        
-        # 复隔中加分（满分6）
-        nums = set([b, s, g])
-        repeat_hit = len(nums & ctx['repeat_codes'])
-        gap_hit = len(nums & ctx['gap_codes'])
-        d9 = min(repeat_hit * 2 + gap_hit * 1.5, 6)
-        details['复隔中'] = round(d9, 1)
-        score += d9
-        
-        # 质合平衡（满分4）
-        prime_count = sum(1 for x in [b, s, g] if x in self.PRIMES)
-        if prime_count in [1, 2]: d10 = 4
-        elif prime_count == 0 or prime_count == 3: d10 = 1
-        else: d10 = 2
-        details['质合'] = round(d10, 1)
-        score += d10
-        
-        # 遗漏甜蜜区（满分5）
-        miss_score = 0
-        for pos, digit in enumerate([b, s, g]):
-            m = ctx['miss'][pos].get(digit, 0)
-            if 8 <= m <= 15: miss_score += 1.5
-            elif 15 < m <= 25: miss_score += 1.0
-            elif m > 25: miss_score += 0.3
-        d11 = min(miss_score, 5)
-        details['遗漏'] = round(d11, 1)
-        score += d11
-        
-        # 伴随号加分（满分4）
-        nums_list = [b, s, g]
-        companion_score = 0
-        for i in range(3):
-            for j in range(i+1, 3):
-                pair = tuple(sorted([nums_list[i], nums_list[j]]))
-                companion_score += ctx['companion_pairs'].get(pair, 0)
-        d12 = min(companion_score * 0.5, 4)
-        details['伴随'] = round(d12, 1)
-        score += d12
         
         return round(score, 1), details
     
-    def generate_candidates_v3(self, data: List[Dict], ctx: Dict, style: str = 'balanced', n_candidates: int = 500) -> List[Tuple]:
+    def generate_candidates(self, data: List[Dict], ctx: Dict, style: str = 'balanced', n_candidates: int = 500) -> List[Tuple]:
+        """
+        多策略候选生成（基于理论概率）
+        
+        策略1: 和值目标采样（和值7-20占83.2%）
+        策略2: 跨度目标采样（跨度4-7占56.4%）
+        策略3: 形态目标采样（组六72%、组三27%）
+        策略4: 蒙特卡洛+多维过滤
+        策略5: 热号组合（用户偏好）
+        """
         candidates = set()
         
-        # 策略1: 贝叶斯采样
-        for _ in range(100):
-            combo = []
-            for pos in range(3):
-                nums = list(range(10))
-                probs = [ctx['bayesian'][pos].get(d, 0.1) for d in nums]
-                total_p = sum(probs)
-                probs = [p / total_p for p in probs]
-                r = random.random()
-                cum = 0
-                for num, p in zip(nums, probs):
-                    cum += p
-                    if r <= cum:
-                        combo.append(num)
-                        break
-            candidates.add(tuple(combo))
-        
-        # 策略2: 指数衰减热号
-        for _ in range(100):
-            combo = []
-            for pos in range(3):
-                hot_nums = [n for n, _ in ctx['heat_weighted'][pos].most_common(6)]
-                combo.append(random.choice(hot_nums))
-            candidates.add(tuple(combo))
-        
-        # 策略3: 复隔中组合
-        repeat_list = list(ctx['repeat_codes'])
-        gap_list = list(ctx['gap_codes'])
-        mid_list = list(ctx['mid_codes'])
-        for _ in range(80):
-            combo = []
-            if repeat_list: combo.append(random.choice(repeat_list))
-            pool = repeat_list + gap_list + mid_list
-            while len(combo) < 3: combo.append(random.choice(pool))
-            random.shuffle(combo)
-            candidates.add(tuple(combo))
-        
-        # 策略4: 和值目标采样
+        # ── 策略1: 和值目标采样（150次）──
         target_hz = int(ctx['hz_avg'])
-        for _ in range(100):
+        for _ in range(150):
             hz_target = target_hz + random.randint(-3, 3)
             b = random.randint(0, 9)
             s = random.randint(0, 9)
             g_needed = hz_target - b - s
-            if 0 <= g_needed <= 9: candidates.add((b, s, g_needed))
+            if 0 <= g_needed <= 9:
+                candidates.add((b, s, g_needed))
         
-        # 策略5: 跨度目标采样
-        for _ in range(80):
-            target_span = random.choice([4, 5, 6, 7])
+        # ── 策略2: 跨度目标采样（120次）──
+        for _ in range(120):
+            target_span = random.choice([4, 5, 6, 7])  # 高频跨度
             b = random.randint(0, 9)
             lo = max(0, b - target_span)
             hi = min(9, b + target_span)
@@ -379,38 +330,42 @@ class SmartNumberSelector:
                 s = random.randint(lo, g)
                 candidates.add((b, s, g))
         
-        # 策略6: 遗漏回补组合
-        high_miss = []
-        for pos in range(3):
-            for digit in range(10):
-                m = ctx['miss'][pos].get(digit, 0)
-                if m >= 12: high_miss.append((pos, digit, m))
-        high_miss.sort(key=lambda x: -x[2])
-        for _ in range(60):
-            combo = [random.randint(0, 9) for _ in range(3)]
-            if high_miss:
-                pos, digit, _ = random.choice(high_miss[:10])
-                combo[pos] = digit
-            candidates.add(tuple(combo))
+        # ── 策略3: 形态目标采样（100次）──
+        for _ in range(100):
+            # 72%概率生成组六，27%概率生成组三
+            if random.random() < 0.72:
+                # 组六：三位不同
+                b, s, g = random.sample(range(10), 3)
+            else:
+                # 组三：两位相同
+                b = random.randint(0, 9)
+                s = random.randint(0, 9)
+                g = b if random.random() < 0.5 else s
+            candidates.add((b, s, g))
         
-        # 策略7: 伴随号组合
-        top_pairs = ctx['companion_pairs'].most_common(10)
-        for _ in range(50):
-            if top_pairs:
-                pair = random.choice(top_pairs)[0]
-                combo = [pair[0], pair[1], random.randint(0, 9)]
-                random.shuffle(combo)
-                candidates.add(tuple(combo))
-        
-        # 策略8: 蒙特卡洛+多维过滤
-        for _ in range(200):
+        # ── 策略4: 蒙特卡洛+多维过滤（200次）──
+        for _ in range(300):
             b, s, g = random.randint(0, 9), random.randint(0, 9), random.randint(0, 9)
             hz = b + s + g
             kd = max(b, s, g) - min(b, s, g)
             odd = sum(1 for x in [b, s, g] if x % 2 == 1)
             big = sum(1 for x in [b, s, g] if x >= 5)
-            if (7 <= hz <= 20 and 4 <= kd <= 7 and odd in [1, 2] and big in [1, 2]):
+            
+            # 多维过滤（基于理论概率）
+            if (7 <= hz <= 20 and  # 和值合理（83.2%）
+                4 <= kd <= 7 and   # 跨度合理（56.4%）
+                odd in [1, 2] and  # 奇偶平衡（75%）
+                big in [1, 2]):    # 大小平衡（75%）
                 candidates.add((b, s, g))
+        
+        # ── 策略5: 热号组合（50次，用户偏好）──
+        if style == 'conservative':
+            for _ in range(50):
+                combo = []
+                for pos in range(3):
+                    hot_nums = [n for n, _ in ctx['freq20'][pos].most_common(5)]
+                    combo.append(random.choice(hot_nums))
+                candidates.add(tuple(combo))
         
         return list(candidates)
     
@@ -428,7 +383,7 @@ class SmartNumberSelector:
         # 评分
         scored = []
         for b, s, g in candidates:
-            sc, details = self.score_candidate_v3(b, s, g, ctx, style)
+            sc, details = self.score_candidate(b, s, g, ctx, style)
             hz = b + s + g
             kd = max(b, s, g) - min(b, s, g)
             unique = len(set([b, s, g]))
@@ -592,20 +547,22 @@ class SmartNumberSelector:
                     hz = b + s + g
                     kd = max(b, s, g) - min(b, s, g)
                     if 7 <= hz <= 20 and 4 <= kd <= 7:
-                        score, details = self.score_candidate_v3(b, s, g, ctx, 'conservative')
+                        score, details = self.score_candidate(b, s, g, ctx, 'conservative')
                         gold_candidates.append((score, b, s, g, details))
         gold_candidates.sort(key=lambda x: -x[0])
         gold = gold_candidates[0][1:4]
         
+        # 银码：综合评分最高（激进策略）
         silver_candidates = []
         for b in range(10):
             for s in range(10):
                 for g in range(10):
-                    if (b, s, g) == gold: continue
+                    if (b, s, g) == gold:
+                        continue
                     hz = b + s + g
                     kd = max(b, s, g) - min(b, s, g)
                     if 7 <= hz <= 20 and 4 <= kd <= 7:
-                        score, details = self.score_candidate_v3(b, s, g, ctx, 'aggressive')
+                        score, details = self.score_candidate(b, s, g, ctx, 'aggressive')
                         silver_candidates.append((score, b, s, g, details))
         silver_candidates.sort(key=lambda x: -x[0])
         silver = silver_candidates[0][1:4]
@@ -613,8 +570,9 @@ class SmartNumberSelector:
         return gold, silver
     
     def analyze_and_recommend(self, data: List[Dict], style: str = 'balanced', top_n: int = 10) -> Tuple[List[Dict], Dict]:
+        """完整分析流程"""
         ctx = self.compute_context(data)
-        candidates = self.generate_candidates_v3(data, ctx, style=style)
+        candidates = self.generate_candidates(data, ctx, style=style)
         selected = self.select_top10_with_coverage(candidates, ctx, style=style)
         return selected, ctx
     
@@ -631,37 +589,33 @@ class SmartNumberSelector:
         report = {
             'data_periods': len(data),
             'style': style,
-            'version': 'V3.0',
-            'method': '贝叶斯+指数衰减+复隔中+多策略共识',
+            'version': 'V3.1',
+            'method': '基于理论概率分布的智能选号（蒙特卡洛+多维过滤）',
             'statistics': {
                 'theoretical_sum_mean': 13.5,
                 'theoretical_span_mean': 4.5,
                 'shape_distribution': self.SHAPE_PROBS,
                 'recent_shapes': dict(ctx['recent_shapes']),
                 'recent_sum_avg': ctx['hz_avg'],
-                'recent_span_avg': ctx['kd_avg'],
                 'miss_stats': miss_stats,
-                'entropy': ctx['entropy'],
-                'max_entropy': ctx['max_entropy'],
-                'repeat_codes': list(ctx['repeat_codes']),
-                'gap_codes': list(ctx['gap_codes']),
             },
             'hot_numbers': {
-                'bai': [x[0] for x in ctx['heat_weighted'][0].most_common(3)],
-                'shi': [x[0] for x in ctx['heat_weighted'][1].most_common(3)],
-                'ge': [x[0] for x in ctx['heat_weighted'][2].most_common(3)]
+                'bai': [x[0] for x in ctx['freq20'][0].most_common(3)],
+                'shi': [x[0] for x in ctx['freq20'][1].most_common(3)],
+                'ge': [x[0] for x in ctx['freq20'][2].most_common(3)]
             },
             'cold_numbers': {
                 'bai': [x[0] for x in ctx['freq20'][0].most_common()[-3:]],
                 'shi': [x[0] for x in ctx['freq20'][1].most_common()[-3:]],
                 'ge': [x[0] for x in ctx['freq20'][2].most_common()[-3:]]
             },
-            'disclaimer': '基于贝叶斯+指数衰减+复隔中+多策略共识的智能选号，不是预测。'
+            'disclaimer': '基于理论概率分布的智能选号，不是预测。命中率≈1%（与随机选号相同），只提高选号质量。'
         }
         
         return report
 
 
 if __name__ == '__main__':
-    print("SmartNumberSelector V3.0")
+    # 测试用
+    print("SmartNumberSelector V3.1")
     print("请通过 run_analysis.py 调用")

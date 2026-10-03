@@ -832,8 +832,8 @@ def format_report(analyzer: DLTAnalyzer, selected: List[Dict]) -> str:
 #  CLI 入口
 # ═══════════════════════════════════════════════════════════════
 if __name__ == '__main__':
-    import sys, json
-    sys.path.insert(0, r'C:\Users\21920\AppData\Local\hermes\skills\data-analysis\lottery-data-analysis')
+    import sys, os, json
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
     from scripts.lottery_analysis import fetch_dlt
 
     print("正在获取大乐透数据...")

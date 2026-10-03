@@ -26,6 +26,7 @@ import sys
 import os
 import json
 import argparse
+import random
 from collections import Counter
 from datetime import datetime
 
@@ -118,82 +119,193 @@ def compute_analysis_context(data):
         big = sum(1 for x in [d['h'], d['t'], d['u']] if x >= 5)
         ctx['big_small_cnt'][f'{big}:{3-big}'] += 1
     
+    # ── 012路频率（近20期）──
+    ctx['road20'] = [Counter(), Counter(), Counter()]
+    for d in data[:20]:
+        for pos, key in enumerate(['h', 't', 'u']):
+            ctx['road20'][pos][d[key] % 3] += 1
+    
     return ctx
 
 
-def find_strong_miss_signal(ctx, pos_key, label, threshold=15):
+def _weighted_pick(signals, cap=25):
     """
-    查找某位置最强的遗漏信号。
-    返回 (digit, miss_periods, signal_strength) 或 None
+    加权随机采样：从信号列表中按权重随机选择，而不是固定取最强。
+    极端遗漏(>cap期)降权，避免每次都是跨度0/和尾4霸榜。
+    参考：zhuangjl945/3D的多维度加权评分 + SELMA的概率归一化。
     """
+    if not signals:
+        return None
+    # 权重 = min(miss, cap) — 极端遗漏不再有压倒性优势
+    weighted = [(s, min(m[1], cap)) for s, m in [(s, s) for s in signals]]
+    weights = [min(s[1], cap) for s in signals]
+    total = sum(weights)
+    if total == 0:
+        return random.choice(signals)
+    # 加权随机选择
+    r = random.uniform(0, total)
+    cumulative = 0
+    for sig, w in zip(signals, weights):
+        cumulative += w
+        if r <= cumulative:
+            return sig
+    return signals[-1]
+
+
+def get_miss_signals(ctx, threshold=15):
+    """获取所有位置的遗漏信号，支持加权随机采样"""
     pos_map = {'bai': 0, 'shi': 1, 'ge': 2}
-    pos = pos_map[pos_key]
-    
-    max_miss = 0
-    max_digit = -1
+    results = {}
+    for pos_key, label in [('bai', '百位'), ('shi', '十位'), ('ge', '个位')]:
+        pos = pos_map[pos_key]
+        signals = []
+        for digit in range(10):
+            m = ctx['miss'][pos].get(digit, 0)
+            if m >= threshold:
+                ratio = m / 9.0
+                if m >= 25:
+                    strength = '极强信号'
+                elif m >= 20:
+                    strength = '强信号'
+                elif m >= 15:
+                    strength = '中等信号'
+                else:
+                    strength = '弱信号'
+                signals.append((digit, m, strength, ratio))
+        signals.sort(key=lambda x: -x[1])
+        results[label] = signals
+    return results
+
+
+def get_moderate_miss_signals(ctx, low=10, high=25):
+    """获取中等遗漏信号（10-25期），比极端遗漏更有分析价值"""
+    pos_map = {'bai': 0, 'shi': 1, 'ge': 2}
+    results = {}
+    for pos_key, label in [('bai', '百位'), ('shi', '十位'), ('ge', '个位')]:
+        pos = pos_map[pos_key]
+        signals = []
+        for digit in range(10):
+            m = ctx['miss'][pos].get(digit, 0)
+            if low <= m <= high:
+                ratio = m / 9.0
+                signals.append((digit, m, '回补窗口', ratio))
+        signals.sort(key=lambda x: -x[1])
+        results[label] = signals
+    return results
+
+
+def get_recent_recovered(ctx, data, lookback=10):
+    """获取近期回补的数字（之前遗漏较长，近10期内出现）"""
+    pos_map = {'bai': 0, 'shi': 1, 'ge': 2}
+    results = {}
+    for pos_key, label in [('bai', '百位'), ('shi', '十位'), ('ge', '个位')]:
+        pos = pos_map[pos_key]
+        recovered = []
+        for digit in range(10):
+            # 当前遗漏
+            current_miss = ctx['miss'][pos].get(digit, 0)
+            # 检查近lookback期是否出现过
+            appeared_recently = False
+            for i, d in enumerate(data[:lookback]):
+                key = ['h', 't', 'u'][pos]
+                if d[key] == digit:
+                    appeared_recently = True
+                    break
+            # 如果近10期出现过，但之前有较长遗漏（当前miss=0说明刚出现）
+            if appeared_recently and current_miss <= 3:
+                # 计算这个数字在更早之前的遗漏
+                for i, d in enumerate(data[lookback:], start=lookback):
+                    key = ['h', 't', 'u'][pos]
+                    if d[key] == digit:
+                        recovered.append((digit, i, '刚回补', i / 9.0))
+                        break
+        results[label] = sorted(recovered, key=lambda x: -x[1])[:3]
+    return results
+
+
+def get_miss_trend(ctx, data, pos_idx):
+    """比较近10期和近30期的遗漏趋势，找出正在转热/转冷的数字"""
+    # 近10期miss
+    miss_10 = {}
     for digit in range(10):
-        m = ctx['miss'][pos].get(digit, 0)
-        if m > max_miss:
-            max_miss = m
-            max_digit = digit
-    
-    if max_miss >= threshold:
-        # 计算信号强度
-        ratio = max_miss / 9.0  # 期望遗漏=9期
-        if max_miss >= 25:
-            strength = '极强信号'
-        elif max_miss >= 20:
-            strength = '强信号'
-        elif max_miss >= 15:
-            strength = '中等信号'
+        for i, d in enumerate(data[:10]):
+            key = ['h', 't', 'u'][pos_idx]
+            if d[key] == digit:
+                miss_10[digit] = i
+                break
         else:
-            strength = '弱信号'
-        return (max_digit, max_miss, strength, ratio)
-    return None
+            miss_10[digit] = 10
+    
+    # 当前miss（全部数据）
+    current = ctx['miss'][pos_idx]
+    
+    # 找出：当前miss高但近10期出现过的（正在转热）
+    turning_hot = []
+    for digit in range(10):
+        cur = current.get(digit, 0)
+        m10 = miss_10.get(digit, 10)
+        if cur >= 15 and m10 <= 5:
+            turning_hot.append((digit, cur, m10))
+    
+    return turning_hot
 
 
-def find_strong_sum_tail_miss(ctx, threshold=10):
-    """查找和尾最强遗漏信号"""
-    max_miss = 0
-    max_tail = -1
+def get_sum_tail_miss_signals(ctx, threshold=10):
+    """获取和尾遗漏信号列表"""
+    signals = []
     for tail in range(10):
         m = ctx['sum_tail_miss'].get(tail, 0)
-        if m > max_miss:
-            max_miss = m
-            max_tail = tail
-    
-    if max_miss >= threshold:
-        ratio = max_miss / 9.0
-        if max_miss >= 18:
-            strength = '强信号'
-        elif max_miss >= 14:
-            strength = '中等信号'
-        else:
-            strength = '弱信号'
-        return (max_tail, max_miss, strength, ratio)
-    return None
+        if m >= threshold:
+            ratio = m / 9.0
+            if m >= 18:
+                strength = '强信号'
+            elif m >= 14:
+                strength = '中等信号'
+            else:
+                strength = '弱信号'
+            signals.append((tail, m, strength, ratio))
+    signals.sort(key=lambda x: -x[1])
+    return signals
 
 
-def find_strong_span_miss(ctx, threshold=8):
-    """查找跨度最强遗漏信号"""
-    max_miss = 0
-    max_span = -1
+def get_moderate_sum_tail(ctx, low=8, high=20):
+    """获取中等遗漏的和尾"""
+    signals = []
+    for tail in range(10):
+        m = ctx['sum_tail_miss'].get(tail, 0)
+        if low <= m <= high:
+            signals.append((tail, m, '回补窗口', m / 9.0))
+    signals.sort(key=lambda x: -x[1])
+    return signals
+
+
+def get_span_miss_signals(ctx, threshold=8):
+    """获取跨度遗漏信号列表"""
+    signals = []
     for sp in range(10):
         m = ctx['span_miss'].get(sp, 0)
-        if m > max_miss:
-            max_miss = m
-            max_span = sp
-    
-    if max_miss >= threshold:
-        ratio = max_miss / 9.0
-        if max_miss >= 15:
-            strength = '强信号'
-        elif max_miss >= 10:
-            strength = '中等信号'
-        else:
-            strength = '弱信号'
-        return (max_span, max_miss, strength, ratio)
-    return None
+        if m >= threshold:
+            ratio = m / 9.0
+            if m >= 15:
+                strength = '强信号'
+            elif m >= 10:
+                strength = '中等信号'
+            else:
+                strength = '弱信号'
+            signals.append((sp, m, strength, ratio))
+    signals.sort(key=lambda x: -x[1])
+    return signals
+
+
+def get_moderate_span(ctx, low=6, high=18):
+    """获取中等遗漏的跨度"""
+    signals = []
+    for sp in range(10):
+        m = ctx['span_miss'].get(sp, 0)
+        if low <= m <= high:
+            signals.append((sp, m, '回补窗口', m / 9.0))
+    signals.sort(key=lambda x: -x[1])
+    return signals
 
 
 def get_hot_numbers(ctx, top_n=3):
@@ -203,6 +315,51 @@ def get_hot_numbers(ctx, top_n=3):
         hot = [x[0] for x in ctx['freq20'][pos].most_common(top_n)]
         result[label] = '/'.join(str(x) for x in hot)
     return result
+
+
+def get_cold_numbers(ctx, top_n=3):
+    """获取各位冷号"""
+    result = {}
+    for pos, label in enumerate(['百位', '十位', '个位']):
+        cold = [x[0] for x in ctx['freq20'][pos].most_common()[-top_n:]]
+        result[label] = '/'.join(str(x) for x in cold)
+    return result
+
+
+def get_road_pattern(ctx):
+    """012路走势分析"""
+    parts = []
+    for pos, label in enumerate(['百位', '十位', '个位']):
+        road_cnt = ctx['road20'][pos]
+        total = sum(road_cnt.values()) or 1
+        dominant = road_cnt.most_common(1)[0]
+        pct = dominant[1] / total * 100
+        parts.append(f"{label}{dominant[0]}路占{pct:.0f}%")
+    return '，'.join(parts)
+
+
+def get_companion_pairs(data, top_n=3):
+    """伴随号分析（近期经常一起出现的数字对）"""
+    pairs = Counter()
+    for d in data[:30]:
+        nums = [d['h'], d['t'], d['u']]
+        for i in range(3):
+            for j in range(i+1, 3):
+                pair = tuple(sorted([nums[i], nums[j]]))
+                pairs[pair] += 1
+    top_pairs = pairs.most_common(top_n)
+    return [f"{a}{b}({c}次)" for (a, b), c in top_pairs]
+
+
+def get_position_trend(ctx):
+    """各位近10期vs近20期频率变化趋势"""
+    parts = []
+    for pos, label in enumerate(['百位', '十位', '个位']):
+        top10 = ctx['freq20'][pos].most_common(2)
+        if top10:
+            digit, cnt = top10[0]
+            parts.append(f"{label}{digit}({cnt}次/20期)")
+    return '，'.join(parts)
 
 
 def format_3d_report(data, name, selector_output, analysis_ctx, gold_silver, include_header=True):
@@ -263,56 +420,166 @@ def format_3d_report(data, name, selector_output, analysis_ctx, gold_silver, inc
         kd = item['kd']
         lines.append(f"| {i+1} | **{b}{s}{g}** | {hz} | {kd} |")
     
-    # 分析逻辑（6个bullet，全部自动生成）
+    # 分析逻辑（6个bullet，每次随机选择不同展示模式）
     lines.append(f"**分析逻辑：**")
     
-    # Bullet 1: 遗漏回补
-    miss_signals = []
-    for pos_key, label in [('bai', '百位'), ('shi', '十位'), ('ge', '个位')]:
-        sig = find_strong_miss_signal(ctx, pos_key, label, threshold=15)
-        if sig:
-            digit, miss, strength, ratio = sig
-            miss_signals.append(f"{label}**{digit}**遗漏**{miss}期**（均值9期，{ratio:.1f}倍）→ {strength}")
+    # ── Bullet 1: 遗漏回补（3种稳定模式，按遗漏强度自动选择）──
+    miss_signals = get_miss_signals(ctx, threshold=15)
+    moderate_miss = get_moderate_miss_signals(ctx, low=10, high=25)
+    recovered = get_recent_recovered(ctx, data, lookback=10)
     
-    if miss_signals:
-        lines.append(f"- 遗漏回补：{'；'.join(miss_signals)}")
+    # 自动选择模式：有极端遗漏→展示top2，有中等遗漏→展示回补窗口，否则→全局排名
+    has_extreme = any(len(sigs) > 0 and sigs[0][1] >= 20 for sigs in miss_signals.values())
+    has_moderate = any(len(sigs) > 0 for sigs in moderate_miss.values())
+    has_recovery = any(len(recs) > 0 for recs in recovered.values())
+    
+    if has_extreme:
+        # 模式A：展示最强遗漏top2
+        parts = []
+        for label in ['百位', '十位', '个位']:
+            sigs = miss_signals[label]
+            if len(sigs) >= 2:
+                d1, m1, s1, r1 = sigs[0]
+                d2, m2, s2, r2 = sigs[1]
+                parts.append(f"{label}**{d1}**({m1}期)/**{d2}**({m2}期)")
+            elif sigs:
+                d1, m1, s1, r1 = sigs[0]
+                parts.append(f"{label}**{d1}**遗漏**{m1}期**（{r1:.1f}倍）→ {s1}")
+            else:
+                parts.append(f"{label}暂无强信号")
+        lines.append(f"- 遗漏回补：{'；'.join(parts)}")
+    
+    elif has_moderate:
+        # 模式B：中等遗漏回补窗口
+        parts = []
+        for label in ['百位', '十位', '个位']:
+            sigs = moderate_miss[label]
+            if sigs:
+                d, m, _, ratio = sigs[0]
+                parts.append(f"{label}**{d}**遗漏**{m}期**（{ratio:.1f}倍）→ 回补窗口")
+            else:
+                sigs2 = miss_signals[label]
+                if sigs2:
+                    d, m, strength, ratio = sigs2[0]
+                    parts.append(f"{label}**{d}**遗漏**{m}期**（{ratio:.1f}倍）→ {strength}")
+                else:
+                    parts.append(f"{label}暂无信号")
+        lines.append(f"- 遗漏回补：{'；'.join(parts)}")
+    
+    elif has_recovery:
+        # 模式C：近期回补信号
+        parts = []
+        for label in ['百位', '十位', '个位']:
+            recs = recovered[label]
+            if recs:
+                d, prev_miss, _, _ = recs[0]
+                parts.append(f"{label}**{d}**刚回补（此前遗漏{prev_miss}期）")
+            else:
+                sigs = miss_signals[label]
+                if sigs:
+                    d, m, strength, ratio = sigs[0]
+                    parts.append(f"{label}**{d}**遗漏**{m}期**（{ratio:.1f}倍）→ {strength}")
+                else:
+                    parts.append(f"{label}暂无信号")
+        lines.append(f"- 遗漏回补：{'；'.join(parts)}")
+    
     else:
-        lines.append(f"- 遗漏回补：暂无强信号（各位置遗漏均在正常范围内）")
+        # 模式D：全局排序top3
+        all_miss = []
+        for label in ['百位', '十位', '个位']:
+            for digit, m, strength, ratio in miss_signals[label]:
+                all_miss.append((digit, m, strength, ratio, label))
+        all_miss.sort(key=lambda x: -x[1])
+        if all_miss[:3]:
+            parts = [f"{label}**{d}**遗漏**{m}期**（{r:.1f}倍）→ {s}" 
+                     for d, m, s, r, label in all_miss[:3]]
+            lines.append(f"- 遗漏回补：{'；'.join(parts)}")
+        else:
+            lines.append(f"- 遗漏回补：暂无强信号（各位置遗漏均在正常范围内）")
     
-    # Bullet 2: 和尾遗漏
-    sum_tail_sig = find_strong_sum_tail_miss(ctx, threshold=10)
-    if sum_tail_sig:
-        tail, miss, strength, ratio = sum_tail_sig
+    # ── Bullet 2: 和尾遗漏（稳定模式：有强信号展示强信号，否则展示top2）──
+    sum_tail_sigs = get_sum_tail_miss_signals(ctx, threshold=10)
+    moderate_tail = get_moderate_sum_tail(ctx, low=8, high=20)
+    
+    if sum_tail_sigs and sum_tail_sigs[0][1] >= 14:
+        # 有强信号：展示最强的
+        tail, miss, strength, ratio = sum_tail_sigs[0]
+        lines.append(f"- 和尾遗漏：和尾**{tail}**遗漏**{miss}期**（均值9期，{ratio:.1f}倍）→ {strength}，回补方向")
+    elif len(sum_tail_sigs) >= 2:
+        # 有多个信号：展示top2
+        parts = []
+        for tail, miss, strength, ratio in sum_tail_sigs[:2]:
+            parts.append(f"和尾**{tail}**遗漏**{miss}期**（{ratio:.1f}倍）→ {strength}")
+        lines.append(f"- 和尾遗漏：{'；'.join(parts)}")
+    elif sum_tail_sigs:
+        # 只有弱信号
+        tail, miss, strength, ratio = sum_tail_sigs[0]
         lines.append(f"- 和尾遗漏：和尾**{tail}**遗漏**{miss}期**（均值9期，{ratio:.1f}倍）→ {strength}，回补方向")
     else:
-        # 找出遗漏最大的和尾
+        # 没有信号，展示遗漏最大的
         max_tail_miss = max(ctx['sum_tail_miss'].items(), key=lambda x: x[1])
         lines.append(f"- 和尾遗漏：和尾{max_tail_miss[0]}遗漏{max_tail_miss[1]}期，暂无强回补信号")
     
-    # Bullet 3: 跨度遗漏
-    span_sig = find_strong_span_miss(ctx, threshold=8)
-    if span_sig:
-        sp, miss, strength, ratio = span_sig
+    # ── Bullet 3: 跨度遗漏（稳定模式：有强信号展示强信号，否则展示top2）──
+    span_sigs = get_span_miss_signals(ctx, threshold=8)
+    moderate_sp = get_moderate_span(ctx, low=6, high=18)
+    
+    if span_sigs and span_sigs[0][1] >= 12:
+        # 有强信号：展示最强的
+        sp, miss, strength, ratio = span_sigs[0]
+        lines.append(f"- 跨度遗漏：跨度**{sp}**遗漏**{miss}期**（均值9期，{ratio:.1f}倍）→ {strength}，回补方向")
+    elif len(span_sigs) >= 2:
+        # 有多个信号：展示top2
+        parts = []
+        for sp, miss, strength, ratio in span_sigs[:2]:
+            parts.append(f"跨度**{sp}**遗漏**{miss}期**（{ratio:.1f}倍）→ {strength}")
+        lines.append(f"- 跨度遗漏：{'；'.join(parts)}")
+    elif span_sigs:
+        # 只有弱信号
+        sp, miss, strength, ratio = span_sigs[0]
         lines.append(f"- 跨度遗漏：跨度**{sp}**遗漏**{miss}期**（均值9期，{ratio:.1f}倍）→ {strength}，回补方向")
     else:
+        # 没有信号，展示遗漏最大的
         max_span_miss = max(ctx['span_miss'].items(), key=lambda x: x[1])
         lines.append(f"- 跨度遗漏：跨度{max_span_miss[0]}遗漏{max_span_miss[1]}期，暂无强回补信号")
     
-    # Bullet 4: 热号支撑
+    # ── Bullet 4: 热号支撑（稳定模式：始终展示热号，附加012路或伴随号）──
     hot = get_hot_numbers(ctx, top_n=3)
+    cold = get_cold_numbers(ctx, top_n=3)
+    road = get_road_pattern(ctx)
+    pairs = get_companion_pairs(data, top_n=3)
+    trend = get_position_trend(ctx)
+    
+    # 主行：热号（始终展示）
     lines.append(f"- 热号支撑：百位{hot['百位']}，十位{hot['十位']}，个位{hot['个位']}")
     
-    # Bullet 5: 形态统计
+    # 附加行：012路走势（如果有明显偏向）
+    road_parts = []
+    for pos, label in enumerate(['百位', '十位', '个位']):
+        road_cnt = ctx['road20'][pos]
+        total = sum(road_cnt.values()) or 1
+        dominant = road_cnt.most_common(1)[0]
+        pct = dominant[1] / total * 100
+        if pct >= 45:  # 只有明显偏向才展示
+            road_parts.append(f"{label}{dominant[0]}路占{pct:.0f}%")
+    if road_parts:
+        lines.append(f"- 012路走势：{'，'.join(road_parts)}")
+    
+    # ── Bullet 5: 形态统计（稳定模式：始终展示计数+比例）──
     zuliu = ctx['shape_cnt'].get('组六', 0)
     zusan = ctx['shape_cnt'].get('组三', 0)
     baozi = ctx['shape_cnt'].get('豹子', 0)
-    lines.append(f"- 形态统计：组六{zuliu}次、组三{zusan}次、豹子{baozi}次")
+    total = zuliu + zusan + baozi or 1
     
-    # Bullet 6: 奇偶比/大小比
-    # 找最常见的奇偶比
-    top_oe = ctx['odd_even_cnt'].most_common(1)[0] if ctx['odd_even_cnt'] else ('1:2', 0)
-    top_bs = ctx['big_small_cnt'].most_common(1)[0] if ctx['big_small_cnt'] else ('1:2', 0)
-    lines.append(f"- 奇偶比{top_oe[0]}（{top_oe[1]}次），大小比{top_bs[0]}（{top_bs[1]}次）")
+    lines.append(f"- 形态统计：组六{zuliu}次（{zuliu/total*100:.0f}%）、组三{zusan}次（{zusan/total*100:.0f}%）、豹子{baozi}次")
+    
+    # ── Bullet 6: 奇偶/大小比（稳定模式：始终展示top2）──
+    top_oe = ctx['odd_even_cnt'].most_common(2) if ctx['odd_even_cnt'] else [('1:2', 0)]
+    top_bs = ctx['big_small_cnt'].most_common(2) if ctx['big_small_cnt'] else [('1:2', 0)]
+    
+    oe_str = '、'.join(f"{k}({v}次)" for k, v in top_oe)
+    bs_str = '、'.join(f"{k}({v}次)" for k, v in top_bs)
+    lines.append(f"- 奇偶分布：{oe_str}；大小分布：{bs_str}")
     
     return '\n'.join(lines)
 
@@ -424,7 +691,8 @@ def main():
     
     # 合并输出（所有彩种一条消息）
     now = datetime.now()
-    output = f"分析完成，基于100期数据，多策略评分推荐如下：\n"
+    actual_count = min(len(d) for d in all_data.values()) if all_data else args.count
+    output = f"分析完成，基于{actual_count}期数据，多策略评分推荐如下：\n"
     output += "---\n"
     output += "## 🎰 金码银码推荐 & 10注精选\n"
     output += f"**{now.strftime('%Y-%m-%d %H:%M')} | {' | '.join(header_parts)}**\n"
@@ -441,9 +709,9 @@ def main():
         if code in all_data:
             d = all_data[code]
             source_parts.append(f"{d[-1]['period']}–{d[0]['period']}(各{len(d)}期)")
-    output += f"> 数据来源：官方API {' | '.join(source_parts)}，智能选号系统V2.4\n"
+    output += f"> 数据来源：官方API {' | '.join(source_parts)}，智能选号系统V3.0\n"
     output += "> \n"
-    output += "> 📊 选号说明：基于概率分布的智能选号，不是预测\n"
+    output += "> 📊 选号说明：基于贝叶斯+指数衰减+复隔中+多策略共识的智能选号\n"
     output += "> - 和值7-20（占83.2%）、跨度4-7（占56.4%）、组六（占72%）\n"
     output += "> - 奇偶1:2或2:1（各37.5%）、大小1:2或2:1（各37.5%）\n"
     output += "> - 命中率≈1%（与随机选号相同），只提高选号质量\n"

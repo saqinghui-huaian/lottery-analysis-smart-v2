@@ -1,7 +1,6 @@
 # Number Recommendation Strategies (金码推荐策略)
 
-> **v3更新 (2026-07-07)**: 以下5种策略已被 `lottery_analysis.py` 中的8策略13维评分系统取代。
-> 保留本文档作为策略概念参考。实际推荐请使用 `references/multi-strategy-scoring.md` 的v3系统。
+> **v2.4.1更新 (2026-09-16)**: 推荐系统已整合到 `smart_selector.py`（3D/排三）和 `dlt_analysis.py`（大乐透）。
 
 **IMPORTANT: All recommendations must be complete 3-digit bets (整注).**
 金码/银码 are presented as complete combinations (e.g. "924", "817"), never as individual digits.
